@@ -86,10 +86,8 @@ static char* remove_separators(const char* str) {
     if (!result) return NULL;
     char* p = result;
     while (*str)
-        if (!isspace((unsigned char)*str))
-            *p++ = *str++;
-        else
-            ++str;
+        if (!isspace((unsigned char)*str)) *p++ = *str++;
+        else ++str;
     *p = '\0';
     return result;
 }
@@ -106,10 +104,10 @@ static Command* create_command(const char* name, const char* sequence_str, int t
         if (start != p) num_steps++;
         if (*p) ++p;
     }
-    if (num_steps == 0) { free(cleaned); return NULL; }
+    if (num_steps == 0) goto error;
 
     Command* cmd = (Command*)malloc(sizeof(Command) + num_steps * sizeof(Step));
-    if (!cmd) { free(cleaned); return NULL; }
+    if (!cmd) goto error;
 
     cmd->name = name;
     cmd->sequence_str = sequence_str;
@@ -180,6 +178,10 @@ static Command* create_command(const char* name, const char* sequence_str, int t
 
     free(cleaned);
     return cmd;
+
+error:
+    free(cleaned);
+    return NULL;
 }
 
 static bool evaluate_step(const Step* step, const Buffers* buf) {
