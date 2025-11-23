@@ -269,17 +269,15 @@ int main(void) {
     characters[0].commands_size = 5;
     characters[0].commands = (Command**)malloc(5 * sizeof(Command*));
     if (characters[0].commands)
-    for (int i = 0; i < 5; ++i) {
+    for (int i = 0; i < 5; ++i)
         characters[0].commands[i] = create_command(ryu_names[i], ryu_seqs[i], ryu_limits[i]);
-    }
 
     characters[1].name = "ケン";
     characters[1].commands_size = 5;
     characters[1].commands = (Command**)malloc(5 * sizeof(Command*));
     if (characters[1].commands)
-    for (int i = 0; i < 5; ++i) {
+    for (int i = 0; i < 5; ++i)
         characters[1].commands[i] = create_command(ken_names[i], ken_seqs[i], ken_limits[i]);
-    }
 
     uint8_t prev_dir = 0;
     uint8_t prev_btn = 0;
