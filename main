@@ -1,0 +1,333 @@
+#define ALLEGRO_NO_MAGIC_MAIN
+#define _CRT_SECURE_NO_WARNINGS
+
+#include <allegro5/allegro.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <ctype.h>
+#include <stdbool.h>
+
+#define DIR_MASK 0xF
+#define BTN_MASK 0x7F
+#define DIR_BUFFER_FRAMES 8
+#define BTN_BUFFER_FRAMES 4
+#define DIR_BUFFER_MASK ((1ULL << (4 * DIR_BUFFER_FRAMES)) - 1)
+#define BTN_BUFFER_MASK ((1ULL << (7 * BTN_BUFFER_FRAMES)) - 1)
+#define CURRENT_DIR_SHIFT (4 * (DIR_BUFFER_FRAMES - 1))
+#define CURRENT_BTN_SHIFT (7 * (BTN_BUFFER_FRAMES - 1))
+
+typedef struct {
+    const char input_char;
+    int allegro_keycode;
+    uint8_t bitmask;
+} KeyMapping;
+
+/* 方向キー */
+static KeyMapping dir_keymap[] = {
+    { 'U', ALLEGRO_KEY_UP,    1 },
+    { 'D', ALLEGRO_KEY_DOWN,  2 },
+    { 'B', ALLEGRO_KEY_LEFT,  4 },
+    { 'F', ALLEGRO_KEY_RIGHT, 8 }
+};
+#define DIR_KEYMAP_SIZE _countof(dir_keymap)
+
+/* ボタン */
+static KeyMapping btn_keymap[] = {
+    { 'a', ALLEGRO_KEY_A,     1 },
+    { 'b', ALLEGRO_KEY_B,     2 },
+    { 'c', ALLEGRO_KEY_C,     4 },
+    { 's', ALLEGRO_KEY_ENTER, 8 },
+    { 'x', ALLEGRO_KEY_X,    16 },
+    { 'y', ALLEGRO_KEY_Y,    32 },
+    { 'z', ALLEGRO_KEY_Z,    64 }
+};
+#define BTN_KEYMAP_SIZE _countof(dir_keymap)
+
+typedef struct {
+    uint8_t dir_hold;
+    uint8_t dir_press;
+    uint8_t dir_release;
+    uint8_t btn_hold;
+    uint8_t btn_press;
+    uint8_t btn_release;
+} Step;
+
+typedef struct {
+    const char* name;
+    const char* sequence_str;
+    int num_steps;
+    int time_limit;
+    uint32_t cmd_var; // 下位4bit: t_e, 上位28bit: element
+    Step steps[]; // 可変長配列
+} Command;
+
+typedef struct {
+    const char* name;
+    Command** commands;
+    int commands_size;
+} Character;
+
+Character* characters = NULL;
+int characters_size = 0;
+
+typedef struct {
+    uint32_t dir_hold, dir_press, dir_release;
+    uint32_t btn_hold, btn_press, btn_release;
+} Buffers;
+
+Buffers input_buffers = { 0 };
+
+static char* remove_separators(const char* str) {
+    if (!str) return NULL;
+    size_t len = strlen(str);
+    char* result = (char*)malloc(len + 1);
+    if (!result) return NULL;
+    char* p = result;
+    while (*str)
+        if (!isspace((unsigned char)*str))
+            *p++ = *str++;
+        else
+            ++str;
+    *p = '\0';
+    return result;
+}
+
+static Command* create_command(const char* name, const char* sequence_str, int time_limit) {
+    char* cleaned = remove_separators(sequence_str);
+    if (!cleaned) return NULL;
+
+    int num_steps = 0;
+    const char* p = cleaned;
+    while (*p) {
+        const char* start = p;
+        while (*p && *p != ',') ++p;
+        if (start != p) num_steps++;
+        if (*p) ++p;
+    }
+    if (num_steps == 0) { free(cleaned); return NULL; }
+
+    Command* cmd = (Command*)malloc(sizeof(Command) + num_steps * sizeof(Step));
+    if (!cmd) { free(cleaned); return NULL; }
+
+    cmd->name = name;
+    cmd->sequence_str = sequence_str;
+    cmd->num_steps = num_steps;
+    cmd->time_limit = time_limit;
+    cmd->cmd_var = 0;
+    memset(cmd->steps, 0, num_steps * sizeof(Step));
+
+    p = cleaned;
+    int idx = 0;
+    while (*p && idx < num_steps) {
+        const char* step_start = p;
+        while (*p && *p != ',') ++p;
+
+        Step s = { 0 };
+        const char* t = step_start;
+        while (t < p) {
+            char ch = *t++;
+            bool is_release = false;
+            bool is_hold = false;
+
+            if (ch == '~') { is_release = true; ch = *t++; }
+            else if (ch == '/') { is_hold = true; ch = *t++; }
+            if (t > p) break;
+
+            bool found = false;
+            bool is_dir = false;
+            uint8_t mask = 0;
+
+            /* 方向キー検索 */
+            for (size_t i = 0; i < DIR_KEYMAP_SIZE; ++i) {
+                if (dir_keymap[i].input_char == ch) {
+                    mask = dir_keymap[i].bitmask;
+                    is_dir = true;
+                    found = true;
+                    break;
+                }
+            }
+            /* ボタンキー検索 */
+            if (!found) {
+                for (size_t i = 0; i < BTN_KEYMAP_SIZE; ++i) {
+                    if (btn_keymap[i].input_char == ch) {
+                        mask = btn_keymap[i].bitmask;
+                        is_dir = false;
+                        found = true;
+                        break;
+                    }
+                }
+            }
+
+            if (found) {
+                if (is_dir) {
+                    if (is_release)   s.dir_release |= mask;
+                    else if (is_hold) s.dir_hold |= mask;
+                    else              s.dir_press |= mask;
+                }
+                else {
+                    if (is_release)   s.btn_release |= mask;
+                    else if (is_hold) s.btn_hold |= mask;
+                    else              s.btn_press |= mask;
+                }
+            }
+        }
+
+        cmd->steps[idx++] = s;
+        if (*p) ++p;
+    }
+
+    free(cleaned);
+    return cmd;
+}
+
+static bool evaluate_step(const Step* step, const Buffers* buf) {
+    uint8_t hold_dir = (buf->dir_hold >> CURRENT_DIR_SHIFT) & DIR_MASK;
+    uint8_t hold_btn = (buf->btn_hold >> CURRENT_BTN_SHIFT) & BTN_MASK;
+    uint8_t press_dir = (buf->dir_press >> CURRENT_DIR_SHIFT) & DIR_MASK;
+    uint8_t press_btn = (buf->btn_press >> CURRENT_BTN_SHIFT) & BTN_MASK;
+    uint8_t rel_dir = (buf->dir_release >> CURRENT_DIR_SHIFT) & DIR_MASK;
+    uint8_t rel_btn = (buf->btn_release >> CURRENT_BTN_SHIFT) & BTN_MASK;
+
+    if (step->dir_hold && (hold_dir & step->dir_hold) != step->dir_hold) return false;
+    if (step->btn_hold && (hold_btn & step->btn_hold) != step->btn_hold) return false;
+    if (step->dir_press && (press_dir & step->dir_press) != step->dir_press) return false;
+    if (step->btn_press && (press_btn & step->btn_press) != step->btn_press) return false;
+    if (step->dir_release && (rel_dir & step->dir_release) != step->dir_release) return false;
+    if (step->btn_release && (rel_btn & step->btn_release) != step->btn_release) return false;
+    return true;
+}
+
+static bool process_command(const Buffers* buf, Command* cmd) {
+    if (!cmd || cmd->num_steps <= 0) return false;
+
+    uint32_t var = cmd->cmd_var;
+    bool success = false;
+
+    if (var) {
+        uint32_t te = var & 0xF;
+        if (te) var = (var & ~0xF) | (te - 1);
+    }
+
+    uint32_t elem = var >> 4;
+    if (elem == (uint32_t)cmd->num_steps) {
+        success = true;
+        var = 0;
+    }
+    else if (elem < (uint32_t)cmd->num_steps) {
+        if (evaluate_step(&cmd->steps[elem], buf)) {
+            elem++;
+            var = (cmd->time_limit & 0xF) | (elem << 4);
+            if (elem == (uint32_t)cmd->num_steps) {
+                success = true;
+                var = 0;
+            }
+        }
+    }
+
+    if (var && (var & 0xF) == 0) var = 0;
+    cmd->cmd_var = var;
+    return success;
+}
+
+static void process_state(Character* ch) {
+    for (int i = 0; i < ch->commands_size; ++i) {
+        if (process_command(&input_buffers, ch->commands[i])) {
+            printf("コマンド '%s' 成功 (キャラ: %s)\n", ch->commands[i]->name, ch->name);
+        }
+    }
+}
+
+int main(void) {
+    if (!al_init() || !al_install_keyboard()) return -1;
+
+    ALLEGRO_DISPLAY* display = al_create_display(1280, 960);
+    ALLEGRO_TIMER* timer = al_create_timer(1.0 / 60.0);
+    ALLEGRO_EVENT_QUEUE* queue = al_create_event_queue();
+    if (!display || !timer || !queue) return -1;
+
+    al_register_event_source(queue, al_get_display_event_source(display));
+    al_register_event_source(queue, al_get_timer_event_source(timer));
+    al_register_event_source(queue, al_get_keyboard_event_source());
+
+    al_start_timer(timer);
+
+    const char* ryu_names[] = { "波動拳", "ダッシュ", "攻撃", "前歩き", "後歩き" };
+    const char* ryu_seqs[] = { "/D, /D & /F, /F, a & b", "~F, F", "U", "/F", "/B" };
+    const int   ryu_limits[] = { 15, 10, 10, 10, 10 };
+
+    const char* ken_names[] = { "波動拳", "昇龍拳", "攻撃", "前歩き", "テスト" };
+    const char* ken_seqs[] = { "/D, /D & /F, /F, a & b", "/F, D, b", "a,b,c", "/F", "/c & /a" };
+    const int   ken_limits[] = { 15, 15, 10, 10, 10 };
+
+    characters = (Character*)malloc(2 * sizeof(Character));
+    if (!characters) return -1;
+    characters_size = 2;
+
+    characters[0].name = "リュウ";
+    characters[0].commands_size = 5;
+    characters[0].commands = (Command**)malloc(5 * sizeof(Command*));
+    if (characters[0].commands)
+    for (int i = 0; i < 5; ++i) {
+        characters[0].commands[i] = create_command(ryu_names[i], ryu_seqs[i], ryu_limits[i]);
+    }
+
+    characters[1].name = "ケン";
+    characters[1].commands_size = 5;
+    characters[1].commands = (Command**)malloc(5 * sizeof(Command*));
+    if (characters[1].commands)
+    for (int i = 0; i < 5; ++i) {
+        characters[1].commands[i] = create_command(ken_names[i], ken_seqs[i], ken_limits[i]);
+    }
+
+    uint8_t prev_dir = 0;
+    uint8_t prev_btn = 0;
+    ALLEGRO_EVENT ev;
+
+    while (true) {
+        al_wait_for_event(queue, &ev);
+
+        if (ev.type == ALLEGRO_EVENT_TIMER) {
+            ALLEGRO_KEYBOARD_STATE ks;
+            al_get_keyboard_state(&ks);
+
+            uint8_t cur_dir = 0;
+            uint8_t cur_btn = 0;
+
+            for (size_t i = 0; i < DIR_KEYMAP_SIZE; ++i)
+                if (al_key_down(&ks, dir_keymap[i].allegro_keycode)) cur_dir |= dir_keymap[i].bitmask;
+            for (size_t i = 0; i < BTN_KEYMAP_SIZE; ++i)
+                if (al_key_down(&ks, btn_keymap[i].allegro_keycode)) cur_btn |= btn_keymap[i].bitmask;
+
+            input_buffers.dir_hold = ((input_buffers.dir_hold >> 4) | ((uint32_t)cur_dir << CURRENT_DIR_SHIFT)) & DIR_BUFFER_MASK;
+            input_buffers.dir_press = ((input_buffers.dir_press >> 4) | ((uint32_t)(cur_dir & ~prev_dir) << CURRENT_DIR_SHIFT)) & DIR_BUFFER_MASK;
+            input_buffers.dir_release = ((input_buffers.dir_release >> 4) | ((uint32_t)(prev_dir & ~cur_dir) << CURRENT_DIR_SHIFT)) & DIR_BUFFER_MASK;
+
+            input_buffers.btn_hold = ((input_buffers.btn_hold >> 7) | ((uint32_t)cur_btn << CURRENT_BTN_SHIFT)) & BTN_BUFFER_MASK;
+            input_buffers.btn_press = ((input_buffers.btn_press >> 7) | ((uint32_t)(cur_btn & ~prev_btn) << CURRENT_BTN_SHIFT)) & BTN_BUFFER_MASK;
+            input_buffers.btn_release = ((input_buffers.btn_release >> 7) | ((uint32_t)(prev_btn & ~cur_btn) << CURRENT_BTN_SHIFT)) & BTN_BUFFER_MASK;
+
+            prev_dir = cur_dir;
+            prev_btn = cur_btn;
+
+            for (int i = 0; i < characters_size; ++i)
+                process_state(&characters[i]);
+        }
+        else if (ev.type == ALLEGRO_EVENT_DISPLAY_CLOSE) break;
+    }
+
+    for (int i = 0; i < characters_size; ++i) {
+        for (int j = 0; j < characters[i].commands_size; ++j)
+            if (characters[i].commands)
+            free(characters[i].commands[j]);
+        free(characters[i].commands);
+        characters[i].commands = NULL;
+    }
+    free(characters);
+
+    al_destroy_timer(timer);
+    al_destroy_display(display);
+    al_destroy_event_queue(queue);
+    return 0;
+}
